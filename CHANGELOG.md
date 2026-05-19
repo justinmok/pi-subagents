@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Coalesced near-simultaneous background completion nudges into one follow-up message. Single unconsumed background completions still trigger a parent turn, while multi-agent completion bursts and separated completions from tracked multi-agent runs display follow-ups without triggering repeated turns.
+- `get_subagent_result` with `wait: true` now marks running and queued agents as consumed immediately, suppressing late completion nudges when result retrieval is queued right after spawn.
+
 ## [0.7.1] - 2026-05-07
 
 > **Heads-up — behavior change:**
