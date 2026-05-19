@@ -11,6 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Coalesced near-simultaneous background completion nudges into one follow-up message. Single unconsumed background completions still trigger a parent turn, while multi-agent completion bursts and separated completions from tracked multi-agent runs display follow-ups without triggering repeated turns.
 - `get_subagent_result` with `wait: true` now marks running and queued agents as consumed immediately, suppressing late completion nudges when result retrieval is queued right after spawn.
+- **`.pi/subagent-schedules/` is no longer created in every working directory.** `ScheduleStore`'s constructor previously ran `mkdirSync` unconditionally, so any session with scheduling enabled left an empty `.pi/subagent-schedules/` dir behind even when nothing was ever scheduled. Directory creation is now lazy — deferred to a new private `ensureDir()` invoked at the top of `withLock`, so the dir (and its `<sessionId>.json`) appear only when a job is actually persisted. Additionally, `update`/`remove` now short-circuit on an unknown id (in-memory `jobs.has(id)` check) before taking the lock, so no-op mutations never touch disk. Read-only use (`list`/`get`/`hasName`) and constructing the store never create the dir. Pre-existing leftover dirs are not cleaned up — remove them manually.
+
+## [0.7.3] - 2026-05-14
+
+### Added
+- **`<active_agent name="…"/>` tag prepended to every child system prompt** ([#73](https://github.com/tintinweb/pi-subagents/pull/73) — thanks [@chris-lasher](https://github.com/chris-lasher)). `buildAgentPrompt` now emits `<active_agent name="${config.name}"/>` as the first line of the assembled prompt in both `replace` and `append` modes, before the env block. Downstream extensions (e.g. permission/policy systems) can parse it from inside the child session to resolve per-agent policy. The tag uses the agent's `config.name` verbatim — no escaping or normalization — and does not couple this extension to any specific downstream consumer; ignoring it is harmless.
+
+### Changed
+- **Subagent sessions now get a stable, type-derived name with an id suffix for parallel spawns** ([#51](https://github.com/tintinweb/pi-subagents/pull/51) — thanks [@forcepushdev](https://github.com/forcepushdev)). `runAgent` calls `session.setSessionName(agentConfig?.name ?? type)`, and when the manager assigns an `agentId` (always, in production), the name is suffixed with an 8-char slice — e.g. `Explore#a1b2c3d4` — so concurrent spawns of the same agent type are distinguishable in the overlay instead of all collapsing onto the same bare name. Direct `runAgent` callers without an `agentId` (e.g. tests) get the bare name.
+
+### Fixed
+- **Cross-extension spawn RPC now accepts a string `options.model`** ([#59](https://github.com/tintinweb/pi-subagents/pull/59), fixes [#60](https://github.com/tintinweb/pi-subagents/issues/60)). Cross-extension callers (e.g. `@tintinweb/pi-tasks@>=0.4.3`'s `TaskExecute`) naturally forward `model` as a serializable `"provider/modelId"` string. Previously the spawn handler passed strings straight through to `runAgent()`, which expects a `Model` object — the spawned agent then crashed with `No API key found for undefined`. The handler now resolves strings via the same `resolveModel(ctx.modelRegistry)` path the scheduler uses; `Model` objects pass through unchanged. Unresolved strings surface the human-readable `Model not found: "…"` error instead of the auth-lookup crash. Thanks @any-victor.
+
+## [0.7.2] - 2026-05-12
+
+> **Heads-up — behavior changes in skill preloading:**
+> - **`.txt` and extensionless flat skill files are no longer loaded.** Only `<name>.md` flat files and `<name>/SKILL.md` directory skills resolve now. Rename any `<name>.txt` or extensionless skill files to `<name>.md`.
+
+### Added
+- **Pi-standard `<name>/SKILL.md` directory layout** is now discovered alongside flat `<name>.md` files. Top-level and nested matches both resolve via BFS — for skill `foo`, the loader checks `<root>/foo/SKILL.md`, then recursively descends looking for `*/.../foo/SKILL.md`. Recursion skips dotfile directories and `node_modules`; a directory that itself contains `SKILL.md` is treated as a single skill (Pi's "skills don't nest" rule).
+- **Five discovery roots**, checked in precedence order:
+  - `<cwd>/.pi/skills/` (project, Pi)
+  - `<cwd>/.agents/skills/` (project, [Agent Skills spec](https://agentskills.io/integrate-skills))
+  - `$PI_CODING_AGENT_DIR/skills/` — default `~/.pi/agent/skills/` (user, Pi)
+  - `~/.agents/skills/` (user, Agent Skills spec)
+  - `~/.pi/skills/` (legacy global, kept for backward compatibility)
+- **Symlink rejection broadened** to the new layouts: symlinked skill roots, nested skill directories, and `SKILL.md` files inside otherwise-real directories are all rejected (intentional deviation from Pi, which follows symlinks).
+- **Deterministic traversal order** — entries are sorted byte-order so collisions resolve identically across filesystems. Pi's iteration order is `readdirSync`-dependent.
+- **Resolved spawn args are now shown in the dedicated conversation viewer** ([#62](https://github.com/tintinweb/pi-subagents/issues/62)). Open `/subagent` → Running Agents → select an agent: a second header row displays the effective invocation — model override (when different from parent), `thinking: <level>`, `isolated`, `worktree`, `inherit context`, `background`, and `max turns: N`. Tags appear when the resolved value is notable (e.g. `isolated: true`), not just when the caller explicitly set it; `max turns` is the one exception and shows only when explicitly configured. Lets you verify the parent agent honored your spawn instructions without scrolling back through the chat. Snapshot stored on the new `AgentRecord.invocation` field. The same tag set is also surfaced on the `Agent` tool-call result render (which previously showed a narrower subset).
+- **`Shift+↑` / `Shift+↓` scroll a full page in the conversation viewer** — same behavior as `PgUp` / `PgDn`. Note: some terminal emulators intercept Shift+arrows for text selection or tab switching, in which case `PgUp`/`PgDn` remain available.
+
+### Changed
+- **`.txt` and extensionless flat skill files are no longer loaded.** Pi only supports `.md`; we now match. **Migration:** rename any `<name>.txt` / `<name>` skill files to `<name>.md`.
+- **Conversation viewer no longer fills the full screen.** The overlay is now capped at 70% of terminal height (90% width unchanged), and the viewer's internal viewport mirrors that cap so the footer/scroll indicator can't be clipped.
 
 ## [0.7.1] - 2026-05-07
 
