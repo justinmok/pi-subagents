@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getDefaultAgentNames, getUserAgentNames, registerAgents, resolveType } from "./agent-types.js";
-import { CompletionNudgeCoordinator } from "./completion-nudges.js";
+import { BackgroundCompletionTracker, CompletionNudgeCoordinator } from "./completion-nudges.js";
 import { registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -299,7 +299,9 @@ export default function (pi: ExtensionAPI) {
     }, { deliverAs: "followUp", triggerTurn });
   }
 
+  const backgroundCompletionTracker = new BackgroundCompletionTracker();
   const completionNudges = new CompletionNudgeCoordinator({
+    shouldTriggerSingle: (record) => backgroundCompletionTracker.shouldTriggerSingle(record.id),
     send: (records, triggerTurn) => {
       try { emitCompletionNudge(records, triggerTurn); } catch { /* ignore stale completion side-effect errors */ }
     },
@@ -367,6 +369,7 @@ export default function (pi: ExtensionAPI) {
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
+      backgroundCompletionTracker.consume(record.id);
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       widget.update();
@@ -473,6 +476,7 @@ export default function (pi: ExtensionAPI) {
     delete (globalThis as any)[MANAGER_KEY];
     scheduler.stop();
     manager.abortAll();
+    backgroundCompletionTracker.clear();
     completionNudges.dispose();
     manager.dispose();
   });
@@ -944,6 +948,7 @@ Guidelines:
         // event loop yields — onSessionCreated is async so this is safe.
         const joinMode = resolveJoinMode(defaultJoinMode, true);
         const record = manager.getRecord(id);
+        backgroundCompletionTracker.add(id);
         if (record && joinMode) {
           record.joinMode = joinMode;
           record.toolCallId = toolCallId;
