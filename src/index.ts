@@ -18,6 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getDefaultAgentNames, getUserAgentNames, registerAgents, resolveType } from "./agent-types.js";
+import { CompletionNudgeCoordinator } from "./completion-nudges.js";
 import { registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -265,79 +266,57 @@ export default function (pi: ExtensionAPI) {
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
+  // ---- Completion nudge helper (async join mode) ----
+  // Holds completion notifications briefly so immediate get_subagent_result calls
+  // can cancel them, and so near-simultaneous completions become one follow-up.
+  function emitCompletionNudge(records: AgentRecord[], triggerTurn: boolean) {
+    const unconsumed = records.filter(r => !r.resultConsumed);
+    if (unconsumed.length === 0) { widget.update(); return; }
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
+    if (unconsumed.length === 1) {
+      const [record] = unconsumed;
+      const notification = formatTaskNotification(record, 500);
+      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: notification + footer,
+        display: true,
+        details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      }, { deliverAs: "followUp", triggerTurn });
+      return;
     }
-  }
 
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+    const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
+    const [first, ...rest] = unconsumed;
+    const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
+    details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
 
     pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
-      content: notification + footer,
+      content: `Background agent group completed: ${unconsumed.length} agent(s) finished\n\n${notifications}\n\nUse get_subagent_result for full output.`,
       display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+      details,
+    }, { deliverAs: "followUp", triggerTurn });
   }
+
+  const completionNudges = new CompletionNudgeCoordinator({
+    send: (records, triggerTurn) => {
+      try { emitCompletionNudge(records, triggerTurn); } catch { /* ignore stale completion side-effect errors */ }
+    },
+  });
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    completionNudges.schedule(record);
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
-    (records, partial) => {
+    (records, _partial) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); }
-
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+      for (const r of records) completionNudges.schedule(r);
       widget.update();
     },
     30_000,
@@ -494,8 +473,7 @@ export default function (pi: ExtensionAPI) {
     delete (globalThis as any)[MANAGER_KEY];
     scheduler.stop();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    completionNudges.dispose();
     manager.dispose();
   });
 
@@ -1139,11 +1117,13 @@ Guidelines:
       // Wait for completion if requested.
       // Pre-mark resultConsumed BEFORE awaiting: onComplete fires inside .then()
       // (attached earlier at spawn time) and always runs before this await resumes.
-      // Setting the flag here prevents a redundant follow-up notification.
-      if (params.wait && record.status === "running" && record.promise) {
+      // Setting the flag here prevents a redundant follow-up notification. Also
+      // mark queued agents immediately so their later completion is suppressed.
+      if (params.wait && (record.status === "running" || record.status === "queued")) {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
-        await record.promise;
+        backgroundCompletionTracker.consume(params.agent_id);
+        completionNudges.cancel(params.agent_id);
+        if (record.promise) await record.promise;
       }
 
       const displayName = getDisplayName(record.type);
@@ -1172,7 +1152,8 @@ Guidelines:
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        backgroundCompletionTracker.consume(params.agent_id);
+        completionNudges.cancel(params.agent_id);
       }
 
       // Verbose: include full conversation
